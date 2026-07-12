@@ -1,0 +1,1284 @@
+From 7cc2e8e74fa06401b7cb060950f4b682be641e09 Mon Sep 17 00:00:00 2001
+From: Ace Eldeib <aeldeib@coreweave.com>
+Date: Wed, 8 Jul 2026 03:36:30 -0400
+Subject: [PATCH] fix: hash speculative draft model config (#47911)
+
+Signed-off-by: Ace Eldeib <aeldeib@coreweave.com>
+Signed-off-by: Ace Eldeib <alexeldeib@gmail.com>
+---
+ vllm/config/speculative.py | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 2e0126368..3dc8d33cf 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -306,8 +306,10 @@ class SpeculativeConfig:
+         )
+         factors.append(uses_aux_hidden_states)
+ 
+-        # The specific layers used also affect the computation graph
+         if uses_aux_hidden_states and self.draft_model_config is not None:
++            factors.append(self.draft_model_config.compute_hash())
++
++            # The specific layers used also affect the computation graph.
+             layer_ids = getattr(
+                 self.draft_model_config.hf_config,
+                 "eagle_aux_hidden_state_layer_ids",
+-- 
+2.43.0
+
+From 0d12618e98ff2d21d36081e0e9b4eb23573b6d38 Mon Sep 17 00:00:00 2001
+From: Michael Goin <mgoin64@gmail.com>
+Date: Wed, 8 Jul 2026 11:12:45 -0400
+Subject: [PATCH] [Spec Decode] Support hybrid (SWA + full attention) DFlash
+ drafters (#47914)
+
+Signed-off-by: mgoin <mgoin64@gmail.com>
+Co-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ vllm/config/vllm.py                           | 17 ++++++++++++
+ vllm/model_executor/models/qwen3_dflash.py    | 26 ++++++++++++-------
+ vllm/v1/worker/gpu/attn_utils.py              |  8 +++---
+ .../gpu/spec_decode/dflash/cudagraph.py       | 11 +++-----
+ .../gpu/spec_decode/dflash/speculator.py      | 20 ++++++++++----
+ .../v1/worker/gpu/spec_decode/dflash/utils.py |  7 +++--
+ .../v1/worker/gpu/spec_decode/dspark/utils.py |  7 +++--
+ vllm/v1/worker/gpu/spec_decode/eagle/utils.py | 10 ++++++-
+ vllm/v1/worker/gpu/spec_decode/speculator.py  |  3 ++-
+ 9 files changed, 79 insertions(+), 30 deletions(-)
+
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index dadf7e35f..062877b16 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -542,6 +542,11 @@ class VllmConfig:
+         ):
+             return True
+ 
++        # Mixed sliding/full DFlash drafts need multiple KV groups (V2 only);
++        # force V2 as for dspark, since a hybrid target otherwise defaults to V1.
++        if self._dflash_needs_multi_kv_group():
++            return True
++
+         if self.model_config is not None and self.model_config.is_diffusion:
+             return True
+ 
+@@ -565,6 +570,18 @@ class VllmConfig:
+ 
+         return True
+ 
++    def _dflash_needs_multi_kv_group(self) -> bool:
++        """Whether a DFlash draft mixes sliding-window and full attention."""
++        spec = self.speculative_config
++        if spec is None or spec.method != "dflash":
++            return False
++        draft_config = getattr(spec, "draft_model_config", None)
++        if draft_config is None:
++            return False
++        layer_types = getattr(draft_config.hf_config, "layer_types", None) or []
++        num_sliding = sum(lt == "sliding_attention" for lt in layer_types)
++        return 0 < num_sliding < len(layer_types)
++
+     def _is_default_v2_model_runner_model(self) -> bool:
+         model_config = self.model_config
+         if model_config is None:
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 6261fc50f..12bc14307 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -86,14 +86,15 @@ def _resolve_layer_attention(
+     if layer_types is not None:
+         num_sliding = sum(lt == SLIDING_ATTENTION for lt in layer_types)
+         any_sliding = num_sliding > 0
+-        all_sliding = num_sliding == len(layer_types)
+-        if any_sliding and not all_sliding:
+-            # Mixed sliding/full attention needs per-layer causal metadata and
+-            # multiple KV-cache groups, which DFlash does not yet support.
++        # Mixed sliding/full attention needs multiple KV groups (V2 runner only).
++        if (
++            0 < num_sliding < len(layer_types)
++            and not get_current_vllm_config().use_v2_model_runner
++        ):
+             raise NotImplementedError(
+-                "DFlash does not yet support mixed sliding/full attention via "
+-                "layer_types; see "
+-                "https://github.com/vllm-project/vllm/issues/40898."
++                "DFlash drafters with mixed sliding/full attention require "
++                "the V2 model runner; relaunch with "
++                "VLLM_USE_V2_MODEL_RUNNER=1."
+             )
+ 
+     default_causal = False
+@@ -207,8 +208,7 @@ class DFlashQwen3Attention(nn.Module):
+             attn_type=attn_type,
+             sinks=self.attention_sink_bias,
+         )
+-        # NOTE: `causal` is currently unused here, but will be needed in the future
+-        # to support models with different causality per-layer.
++        self.causal = causal
+         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+ 
+@@ -709,6 +709,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+     ) -> torch.Tensor:
+         return self.model(input_ids, positions, inputs_embeds)
+ 
++    def get_draft_kv_cache_layer_names(self) -> list[str]:
++        return [layer.self_attn.attn.layer_name for layer in self.model.layers]
++
++    def get_draft_attn_causal(self) -> list[bool]:
++        """Per-layer attention causality, aligned with
++        get_draft_kv_cache_layer_names."""
++        return [layer.self_attn.causal for layer in self.model.layers]
++
+     def compute_logits(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm/v1/worker/gpu/attn_utils.py b/vllm/v1/worker/gpu/attn_utils.py
+index dfa2daacf..228fd08a7 100644
+--- a/vllm/v1/worker/gpu/attn_utils.py
++++ b/vllm/v1/worker/gpu/attn_utils.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from collections.abc import Iterable, Sequence
++from collections.abc import Iterable, Mapping, Sequence
+ from dataclasses import dataclass, replace
+ from math import prod
+ from typing import Any, cast
+@@ -573,7 +573,7 @@ def build_attn_metadata(
+     mm_req_doc_ranges: dict[int, list[tuple[int, int]]] | None = None,
+     model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+     for_cudagraph_capture: bool = False,
+-    causal: bool = True,
++    causal: bool | Mapping[int, bool] = True,
+     rswa_prefix_lens: torch.Tensor | None = None,
+ ) -> dict[str, Any]:
+     seq_lens = seq_lens[:num_reqs]
+@@ -587,6 +587,8 @@ def build_attn_metadata(
+     for i in range(num_kv_cache_groups):
+         block_table = block_tables[i]
+         slot_mapping = slot_mappings[i]
++        # Per-group causal for hybrid drafters (mixed SWA/full attention).
++        group_causal = causal if isinstance(causal, bool) else causal.get(i, True)
+ 
+         common_attn_metadata_extra_kwargs = (
+             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)
+@@ -604,7 +606,7 @@ def build_attn_metadata(
+             max_query_len=max_query_len,
+             block_table_tensor=block_table,
+             slot_mapping=slot_mapping,
+-            causal=causal,
++            causal=group_causal,
+             dcp_local_seq_lens=dcp_local_seq_lens,
+             positions=positions,
+             mm_req_doc_ranges=mm_req_doc_ranges,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+index 3e4b2b7e7..a4b4033ca 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from collections.abc import Callable
++from collections.abc import Callable, Mapping
+ 
+ import torch
+ 
+@@ -29,7 +29,7 @@ def _prepare_dflash_inputs_to_capture(
+     kv_cache_config: KVCacheConfig,
+     max_model_len: int,
+     skip_attn: bool,
+-    causal: bool,
++    causal: bool | Mapping[int, bool],
+ ) -> AttentionState:
+     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+@@ -63,10 +63,6 @@ class DFlashCudaGraphManager(CudaGraphManager):
+     """DFlash CudaGraphManager for the parallel-drafting query forward,
+     building its own attention metadata from scratch."""
+ 
+-    def __init__(self, *args, causal: bool = False, **kwargs) -> None:
+-        super().__init__(*args, **kwargs)
+-        self.causal = causal
+-
+     def capture(
+         self,
+         forward_fn: Callable,
+@@ -75,6 +71,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
+         attn_groups: list[list[AttentionGroup]],
+         kv_cache_config: KVCacheConfig,
+         max_model_len: int,
++        causal: bool | Mapping[int, bool],
+         progress_bar_desc: str = "Capturing CUDA graphs",
+     ) -> None:
+         def create_forward_fn(
+@@ -97,7 +94,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
+                 kv_cache_config,
+                 max_model_len,
+                 skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
+-                causal=self.causal,
++                causal=causal,
+             )
+             attn_metadata, slot_mappings = attn_state
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index b2762244a..f9ffd3135 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from collections.abc import Mapping
+ from typing import Any
+ 
+ import torch
+@@ -94,7 +95,6 @@ class DFlashSpeculator(DraftModelSpeculator):
+             self.device,
+             cudagraph_mode,
+             decode_query_len=self.num_query_per_req,
+-            causal=self.dflash_causal,
+         )
+ 
+     def capture(self, attn_states: dict | None = None) -> None:
+@@ -112,6 +112,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             self.attn_groups,
+             self.kv_cache_config,
+             self.max_model_len,
++            causal=self._group_causal,
+             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+         )
+ 
+@@ -148,7 +149,10 @@ class DFlashSpeculator(DraftModelSpeculator):
+         # of the kv-cache group its cache belongs to. Models that share a single group
+         # leave this as None and share one context slot mapping.
+         self._layer_group_idx: list[int] | None = None
++        # Per-KV-group causal, falling back to the scalar dflash_causal.
++        self._group_causal: dict[int, bool] | bool = self.dflash_causal
+         if hasattr(self.model, "get_draft_kv_cache_layer_names"):
++            layer_names = self.model.get_draft_kv_cache_layer_names()
+             name_to_gid = {
+                 ln: gid
+                 for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+@@ -156,9 +160,15 @@ class DFlashSpeculator(DraftModelSpeculator):
+             }
+             gid_to_idx = {gid: i for i, gid in enumerate(self.draft_kv_cache_group_ids)}
+             self._layer_group_idx = [
+-                gid_to_idx[name_to_gid[name]]
+-                for name in self.model.get_draft_kv_cache_layer_names()
++                gid_to_idx[name_to_gid[name]] for name in layer_names
+             ]
++            if hasattr(self.model, "get_draft_attn_causal"):
++                self._group_causal = {
++                    name_to_gid[name]: layer_causal
++                    for name, layer_causal in zip(
++                        layer_names, self.model.get_draft_attn_causal()
++                    )
++                }
+ 
+     @torch.inference_mode()
+     def _run_model(
+@@ -226,7 +236,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+         num_reqs_padded: int,
+         num_tokens_padded: int,
+         num_query_per_req: int | None = None,
+-        causal: bool = False,
++        causal: bool | Mapping[int, bool] = False,
+     ) -> dict[str, Any] | None:
+         if not self.draft_attn_layer_names:
+             return None
+@@ -383,7 +393,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             num_reqs=num_reqs,
+             num_reqs_padded=num_reqs_padded,
+             num_tokens_padded=num_tokens_padded,
+-            causal=self.dflash_causal,
++            causal=self._group_causal,
+         )
+         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+             self.block_tables.slot_mappings[:, :num_tokens_padded],
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+index c4f98e715..37fe693bb 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/utils.py
+@@ -5,7 +5,10 @@ import torch.nn as nn
+ from vllm.config import ModelConfig, VllmConfig, replace
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.model_executor.model_loader import get_model
+-from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
++from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
++    _should_share,
++    get_target_lm_head,
++)
+ 
+ 
+ def get_dflash_causal(draft_model_config: ModelConfig) -> bool:
+@@ -57,7 +60,7 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+                 del draft_inner.embed_tokens
+             draft_inner.embed_tokens = target_embed
+ 
+-    target_lm_head = getattr(target_model, "lm_head", None)
++    target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(dflash_model, "lm_head", None)
+     if target_lm_head is not None and _should_share(
+         dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index acc32dafc..08ff30e5f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -6,7 +6,10 @@ import torch.nn as nn
+ from vllm.config import VllmConfig, replace
+ from vllm.distributed.parallel_state import get_pp_group
+ from vllm.model_executor.model_loader import get_model
+-from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
++from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
++    _should_share,
++    get_target_lm_head,
++)
+ 
+ 
+ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+@@ -52,7 +55,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
+             del draft_inner.embed_tokens
+         draft_inner.embed_tokens = target_embed
+ 
+-    target_lm_head = getattr(target_model, "lm_head", None)
++    target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(draft_model, "lm_head", None)
+     if target_lm_head is not None and _should_share(
+         draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+index 11961ceef..bdd588e57 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -25,6 +25,14 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
+     return torch.equal(w, target.weight)
+ 
+ 
++def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):
++    """The target's lm_head — from get_language_model() for
++    *ForConditionalGeneration targets, else the top-level module."""
++    return getattr(target_language_model, "lm_head", None) or getattr(
++        target_model, "lm_head", None
++    )
++
++
+ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+     from vllm.compilation.backends import set_model_tag
+ 
+@@ -64,7 +72,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
+                 del draft_inner.embed_tokens
+             draft_inner.embed_tokens = target_embed
+ 
+-    target_lm_head = getattr(target_model, "lm_head", None)
++    target_lm_head = get_target_lm_head(target_model, target_language_model)
+     draft_lm_head = getattr(eagle_model, "lm_head", None)
+     if target_lm_head is not None and _should_share(
+         eagle_model, "has_own_lm_head", draft_lm_head, target_lm_head
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 9e36c7cc6..4b7d7fef4 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
++from collections.abc import Mapping
+ from typing import Any
+ 
+ import torch
+@@ -202,7 +203,7 @@ class DraftModelSpeculator(BaseSpeculator):
+         num_reqs_padded: int,
+         num_tokens_padded: int,
+         num_query_per_req: int = 1,
+-        causal: bool = True,
++        causal: bool | Mapping[int, bool] = True,
+     ) -> dict[str, Any] | None:
+         # Uniform query: query_start_loc[i] = min(i, num_reqs) * num_query_per_req.
+         # Clamp keeps the series non-decreasing past num_reqs, which some
+-- 
+2.43.0
+
+From c2ecd0f888228f6583ac56392b79cfbe3626ed5e Mon Sep 17 00:00:00 2001
+From: Martin Vit <martin@voipmonitor.org>
+Date: Wed, 8 Jul 2026 11:22:20 -0400
+Subject: [PATCH] Fix FlashAttention MLA prefill V unpadding (#42642)
+
+Signed-off-by: Martin Vit <martin@voipmonitor.org>
+Signed-off-by: Matthew Bonanni <mbonanni@redhat.com>
+Co-authored-by: Matthew Bonanni <mbonanni@redhat.com>
+---
+ vllm/model_executor/layers/attention/mla_attention.py | 4 ++++
+ vllm/v1/attention/backends/mla/prefill/flash_attn.py  | 4 ----
+ vllm/v1/attention/ops/merge_attn_states.py            | 8 ++++++++
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 027f19a90..b8f197b31 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -2409,6 +2409,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+                     q, kv_c_and_k_pe_cache, attn_metadata, k_scale
+                 )
+ 
++            context_output = context_output[..., : self.v_head_dim]
++            suffix_output = suffix_output[..., : self.v_head_dim]
++
+             output = output.view(-1, self.num_heads, self.v_head_dim)
+             merge_attn_states(
+                 output=output,
+@@ -2421,6 +2424,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
+         elif output_scale is None:
+             # With output_scale set, backend already wrote into `output` in place.
+             assert isinstance(output_prefill, torch.Tensor)
++            output_prefill = output_prefill[..., : self.v_head_dim]
+             output_prefill = output_prefill.flatten(start_dim=-2)
+             output.copy_(output_prefill)
+ 
+diff --git a/vllm/v1/attention/backends/mla/prefill/flash_attn.py b/vllm/v1/attention/backends/mla/prefill/flash_attn.py
+index 470197876..70e1f41c8 100644
+--- a/vllm/v1/attention/backends/mla/prefill/flash_attn.py
++++ b/vllm/v1/attention/backends/mla/prefill/flash_attn.py
+@@ -192,10 +192,6 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
+         if isinstance(attn_out, tuple):
+             attn_out, lse = attn_out[0], attn_out[1]
+ 
+-        # Unpad output back to v_head_dim if we padded V
+-        if self.requires_v_padding:
+-            attn_out = attn_out[..., : v.shape[-1]]
+-
+         # Remain consistent with old `flash_attn_varlen_func` where there
+         # is only one output tensor if `return_softmax_lse` is False.
+         if return_softmax_lse:
+diff --git a/vllm/v1/attention/ops/merge_attn_states.py b/vllm/v1/attention/ops/merge_attn_states.py
+index cf4338fb1..20c7503e9 100644
+--- a/vllm/v1/attention/ops/merge_attn_states.py
++++ b/vllm/v1/attention/ops/merge_attn_states.py
+@@ -46,6 +46,14 @@ def merge_attn_states(
+             When provided, output must be FP8 dtype.
+     """
+ 
++    # Both the CUDA and Triton kernels derive the suffix head stride from
++    # prefix_output, so suffix_output must share the same head stride.
++    assert prefix_output.stride(1) == suffix_output.stride(1), (
++        "merge_attn_states requires prefix_output and suffix_output to have "
++        f"matching head strides, got {prefix_output.stride(1)} and "
++        f"{suffix_output.stride(1)}"
++    )
++
+     # NOTE(DefTruth): Currently, custom merge_attn_states CUDA kernel
+     # does not support FP8 dtype for inputs, fallback to use Triton kernel.
+     # However, when output_scale is provided, the inputs are still BF16/FP16
+-- 
+2.43.0
+
+From 95d6d6f4bba8234088e62124ff20a482acd98714 Mon Sep 17 00:00:00 2001
+From: Nick Hill <nickhill123@gmail.com>
+Date: Thu, 9 Jul 2026 00:39:40 +0100
+Subject: [PATCH] [Bugfix] Use int8 workspace for FlashInfer MLA decode
+ (#48046)
+
+Signed-off-by: Nick Hill <nickhill123@gmail.com>
+Co-authored-by: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../attention/test_flashinfer_mla_decode.py   | 132 ++++++++++++------
+ .../attention/backends/mla/flashinfer_mla.py  |   4 +-
+ .../backends/mla/flashinfer_mla_sparse.py     |   4 +-
+ 3 files changed, 93 insertions(+), 47 deletions(-)
+
+diff --git a/tests/kernels/attention/test_flashinfer_mla_decode.py b/tests/kernels/attention/test_flashinfer_mla_decode.py
+index d183f67d3..d1bd55eeb 100644
+--- a/tests/kernels/attention/test_flashinfer_mla_decode.py
++++ b/tests/kernels/attention/test_flashinfer_mla_decode.py
+@@ -17,6 +17,43 @@ if not current_platform.has_device_capability(100):
+ else:
+     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+ 
++# Deepseek R1 MLA config.
++NUM_HEADS = 128
++KV_LORA_RANK = 512
++QK_NOPE_HEAD_DIM = 128
++QK_ROPE_HEAD_DIM = 64
++QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM
++SCALE = (QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM) ** -0.5
++
++
++def _make_decode_inputs(bs: int, block_size: int, dtype: torch.dtype):
++    """Build valid trtllm MLA decode inputs on the current CUDA device."""
++    max_seq_len_cap = 1024
++    seq_lens = [torch.randint(2, max_seq_len_cap, (1,)).item() for _ in range(bs)]
++    seq_lens[-1] = max_seq_len_cap
++    max_seq_len = max(seq_lens)
++    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32)
++
++    # Generate block tables with random but unique block IDs
++    # From https://github.com/flashinfer-ai/flashinfer/pull/1222
++    blocks_per_seq = (seq_lens_tensor + block_size - 1) // block_size
++    max_num_blocks_per_seq = max(blocks_per_seq.max().item(), 4)
++    total_blocks_needed = int(sum(blocks_per_seq))
++    all_block_ids = torch.randperm(total_blocks_needed)
++
++    block_tables = torch.zeros((bs, max_num_blocks_per_seq), dtype=torch.int32)
++    block_id = 0
++    for i in range(bs):
++        num_blocks_needed = blocks_per_seq[i]
++        block_tables[i, :num_blocks_needed] = all_block_ids[
++            block_id : block_id + num_blocks_needed
++        ]
++        block_id += num_blocks_needed
++
++    kv_cache = torch.randn(block_tables.numel(), block_size, QK_HEAD_DIM).to(dtype)
++    q = torch.randn(bs, NUM_HEADS, QK_HEAD_DIM).to(dtype)
++    return q, kv_cache, block_tables, seq_lens_tensor, max_seq_len
++
+ 
+ def ref_mla(
+     out: Tensor,  # (bs, num_heads, v_head_dim)
+@@ -49,49 +86,12 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
+     torch.set_default_device("cuda")
+     torch.manual_seed(42)
+ 
+-    # Deepseek R1 config
+-    num_heads = 128
+-    kv_lora_rank = 512
+-    qk_nope_head_dim = 128
+-    qk_rope_head_dim = 64
+-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+-    scale = (qk_nope_head_dim + qk_rope_head_dim) ** -0.5
+-
+-    MAX_SEQ_LEN = 1024
+-
+-    seq_lens = [torch.randint(2, MAX_SEQ_LEN, (1,)).item() for _ in range(bs)]
+-    seq_lens[-1] = MAX_SEQ_LEN
+-    max_seq_len = max(seq_lens)
+-    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32)
+-
+-    # Generate block tables with random but unique block IDs
+-    # From https://github.com/flashinfer-ai/flashinfer/pull/1222
+-    blocks_per_seq = (seq_lens_tensor + block_size - 1) // block_size
+-    max_num_blocks_per_seq = max(blocks_per_seq.max().item(), 4)
+-    total_blocks_needed = sum(blocks_per_seq)
+-    # Get random unique IDs for all blocks
+-    all_block_ids = torch.randperm(total_blocks_needed)
+-
+-    block_id = 0
+-    block_tables = torch.zeros(
+-        (bs, max_num_blocks_per_seq),
+-        dtype=torch.int32,
++    q, kv_cache, block_tables, seq_lens_tensor, max_seq_len = _make_decode_inputs(
++        bs, block_size, dtype
+     )
+ 
+-    # Populate block tables and track block assignments
+-    block_id = 0
+-    for i in range(bs):
+-        num_blocks_needed = blocks_per_seq[i]
+-        block_tables[i, :num_blocks_needed] = all_block_ids[
+-            block_id : block_id + num_blocks_needed
+-        ]
+-        block_id += num_blocks_needed
+-
+-    kv_cache = torch.randn(block_tables.numel(), block_size, qk_head_dim).to(dtype)
+-    q = torch.randn(bs, num_heads, qk_head_dim).to(dtype)
+-
+-    out_ref = q.new_zeros(bs, num_heads, kv_lora_rank)
+-    ref_mla(out_ref, q, kv_cache, scale, block_tables, seq_lens_tensor)
++    out_ref = q.new_zeros(bs, NUM_HEADS, KV_LORA_RANK)
++    ref_mla(out_ref, q, kv_cache, SCALE, block_tables, seq_lens_tensor)
+ 
+     workspace_buffer = torch.zeros(
+         FLASHINFER_WORKSPACE_BUFFER_SIZE,
+@@ -107,13 +107,55 @@ def test_flashinfer_mla_decode(dtype: torch.dtype, bs: int, block_size: int):
+         query=q,
+         kv_cache=kv_cache.unsqueeze(1),
+         workspace_buffer=workspace_buffer,
+-        qk_nope_head_dim=qk_nope_head_dim,
+-        kv_lora_rank=kv_lora_rank,
+-        qk_rope_head_dim=qk_rope_head_dim,
++        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
++        kv_lora_rank=KV_LORA_RANK,
++        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+         block_tables=block_tables,
+         seq_lens=seq_lens_tensor,
+         max_seq_len=max_seq_len,
+-        bmm1_scale=scale,
++        bmm1_scale=SCALE,
+     )
+     out_ans = out_ans.squeeze(1)
+     torch.testing.assert_close(out_ans, out_ref, atol=1e-2, rtol=1e-2)
++
++
++def test_flashinfer_mla_decode_workspace_supports_autotune():
++    """vLLM's FlashInfer MLA decode workspace must be int8 for autotuning.
++
++    Model Runner V2's warmup autotunes ``trtllm_batch_decode_mla``, which makes
++    the FlashInfer autotuner enumerate the CuteDSL tactic. That tactic asserts
++    ``workspace_buffer.dtype == torch.int8``; the trtllm-gen path (used for
++    normal, non-autotuned inference) instead views the buffer as uint8, so a
++    uint8 workspace only fails once the autotuner tries CuteDSL. That regressed
++    every DeepSeek MLA test on Blackwell under V2 with
++    ``workspace_buffer must be torch.int8`` (vllm-project/vllm#46646).
++    """
++    from flashinfer.autotuner import autotune
++
++    from vllm.v1.attention.backends.mla.flashinfer_mla import _get_workspace_buffer
++
++    torch.set_default_device("cuda")
++    torch.manual_seed(0)
++
++    workspace_buffer = _get_workspace_buffer(return_lse=False)
++    assert workspace_buffer.dtype == torch.int8
++
++    q, kv_cache, block_tables, seq_lens_tensor, max_seq_len = _make_decode_inputs(
++        bs=1, block_size=64, dtype=torch.bfloat16
++    )
++
++    # Under the autotuner the CuteDSL tactic is instantiated with our workspace;
++    # a uint8 buffer raises AssertionError here, an int8 buffer succeeds.
++    with torch.inference_mode(), autotune(True):
++        trtllm_batch_decode_with_kv_cache_mla(
++            query=q.unsqueeze(1),
++            kv_cache=kv_cache.unsqueeze(1),
++            workspace_buffer=workspace_buffer,
++            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
++            kv_lora_rank=KV_LORA_RANK,
++            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
++            block_tables=block_tables,
++            seq_lens=seq_lens_tensor,
++            max_seq_len=max_seq_len,
++            bmm1_scale=SCALE,
++        )
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla.py b/vllm/v1/attention/backends/mla/flashinfer_mla.py
+index 8ebe3c908..0a6eb14e0 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla.py
+@@ -42,7 +42,9 @@ def _get_workspace_buffer(return_lse: bool) -> torch.Tensor:
+         else FLASHINFER_MLA_WORKSPACE_BUFFER_SIZE
+     )
+     if _fi_workspace is None or _fi_workspace.numel() < buffer_size:
+-        _fi_workspace = torch.zeros(buffer_size, dtype=torch.uint8, device="cuda")
++        # FlashInfer's CuteDSL MLA-decode tactic requires an int8 workspace;
++        # the trtllm-gen path views it as uint8, so int8 is safe for all backends.
++        _fi_workspace = torch.zeros(buffer_size, dtype=torch.int8, device="cuda")
+     return _fi_workspace
+ 
+ 
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+index 97778dfea..b66952cc7 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+@@ -355,9 +355,11 @@ _fi_sparse_workspace: torch.Tensor | None = None
+ def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
+     global _fi_sparse_workspace
+     if _fi_sparse_workspace is None:
++        # FlashInfer's CuteDSL MLA-decode tactic requires an int8 workspace;
++        # the trtllm-gen path views it as uint8, so int8 is safe for all backends.
+         _fi_sparse_workspace = torch.zeros(
+             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+-            dtype=torch.uint8,
++            dtype=torch.int8,
+             device=device,
+         )
+     return _fi_sparse_workspace
+-- 
+2.43.0
+
+From 1cd75b3dd4b3bf90e4ef81831b6f0dd91fde2fe1 Mon Sep 17 00:00:00 2001
+From: Benjamin Chislett <bchislett@nvidia.com>
+Date: Thu, 9 Jul 2026 18:18:19 +0900
+Subject: [PATCH] [Bugfix] Fix race condition in KVBlockZeroer (#48085)
+
+Signed-off-by: Benjamin Chislett <bchislett@nvidia.com>
+Signed-off-by: Benjamin Chislett <chislett.ben@gmail.com>
+Co-authored-by: Wentao Ye <44945378+yewentao256@users.noreply.github.com>
+---
+ tests/v1/worker/test_kv_block_zeroer.py | 44 +++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py      |  1 +
+ vllm/v1/worker/gpu_model_runner.py      |  1 +
+ vllm/v1/worker/utils.py                 | 57 ++++++++++++++++---------
+ 4 files changed, 83 insertions(+), 20 deletions(-)
+ create mode 100644 tests/v1/worker/test_kv_block_zeroer.py
+
+diff --git a/tests/v1/worker/test_kv_block_zeroer.py b/tests/v1/worker/test_kv_block_zeroer.py
+new file mode 100644
+index 000000000..8f1522991
+--- /dev/null
++++ b/tests/v1/worker/test_kv_block_zeroer.py
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm.v1.worker.utils import KVBlockZeroer
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
++    device = torch.device("cuda")
++    num_blocks = 4
++    page_size_el = 4
++    storage = torch.ones((num_blocks, page_size_el), dtype=torch.int32, device=device)
++
++    # Build the minimal zeroer state directly so the test can focus on ID-buffer
++    # lifetime without constructing model attention groups.
++    zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
++    zeroer.device = device
++    zeroer.pin_memory = True
++    zeroer.max_concurrency = 2
++    zeroer._id_cap = 8
++    zeroer._allocate_id_buffers()
++    zeroer._meta = (
++        torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
++        page_size_el,
++        page_size_el,
++        1,
++    )
++
++    stream = torch.cuda.Stream()
++    with torch.cuda.stream(stream):
++        # Keep the first nonblocking H2D copy pending while the host submits the
++        # second call. A single shared pinned source would be overwritten here.
++        torch.cuda._sleep(10_000_000)
++        zeroer.zero_block_ids([1])
++        zeroer.zero_block_ids([2])
++    stream.synchronize()
++
++    assert torch.all(storage[0] == 1)
++    assert torch.all(storage[1] == 0)
++    assert torch.all(storage[2] == 0)
++    assert torch.all(storage[3] == 1)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c74307d0b..f5f51a826 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -498,6 +498,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             kernel_block_sizes=self.kernel_block_sizes,
+             cache_dtype=self.cache_config.cache_dtype,
+             static_forward_context=self.compilation_config.static_forward_context,
++            max_concurrency=self.vllm_config.max_concurrent_batches,
+         )
+ 
+     @torch.inference_mode()
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index dd214a6f3..38500ab05 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1123,6 +1123,7 @@ class GPUModelRunner(
+             cache_dtype=self.cache_config.cache_dtype,
+             runner_only_attn_layers=self.runner_only_attn_layers,
+             static_forward_context=self.compilation_config.static_forward_context,
++            max_concurrency=self.vllm_config.max_concurrent_batches,
+         )
+ 
+     def _zero_block_ids(self, block_ids: list[int]) -> None:
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index c0f44b6db..2c2f93000 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -94,6 +94,7 @@ class KVBlockZeroer:
+         cache_dtype: str,
+         static_forward_context: dict[str, Any],
+         runner_only_attn_layers: set[str] | None = None,
++        max_concurrency: int = 1,
+     ) -> None:
+         """Precompute the absolute-address table for the Triton zeroing kernel.
+ 
+@@ -109,10 +110,14 @@ class KVBlockZeroer:
+         """
+         self.device = device
+         self.pin_memory = pin_memory
++        if max_concurrency < 1:
++            raise ValueError("max_concurrency must be at least 1")
++        self.max_concurrency = max_concurrency
+         self._meta: tuple[torch.Tensor, int, int, int] | None = None
+         self._id_cap: int = 0
+-        self._ids_pinned: torch.Tensor | None = None
+-        self._ids_gpu: torch.Tensor | None = None
++        self._ids_pinned: list[torch.Tensor] = []
++        self._ids_gpu: list[torch.Tensor] = []
++        self._id_buffer_index = 0
+ 
+         if runner_only_attn_layers is None:
+             runner_only_attn_layers = set()
+@@ -175,12 +180,7 @@ class KVBlockZeroer:
+ 
+         blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+         self._id_cap = 8192
+-        self._ids_pinned = torch.empty(
+-            self._id_cap,
+-            dtype=torch.int64,
+-            pin_memory=self.pin_memory,
+-        )
+-        self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
++        self._allocate_id_buffers()
+         self._meta = (
+             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+             page_size_el,
+@@ -188,6 +188,21 @@ class KVBlockZeroer:
+             len(seg_addrs),
+         )
+ 
++    def _allocate_id_buffers(self) -> None:
++        self._ids_pinned = [
++            torch.empty(
++                self._id_cap,
++                dtype=torch.int64,
++                pin_memory=self.pin_memory,
++            )
++            for _ in range(self.max_concurrency)
++        ]
++        self._ids_gpu = [
++            torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
++            for _ in range(self.max_concurrency)
++        ]
++        self._id_buffer_index = 0
++
+     def zero_block_ids(self, block_ids: list[int]) -> None:
+         """Zero the KV cache memory for the given block IDs."""
+         if not block_ids or self._meta is None:
+@@ -195,19 +210,21 @@ class KVBlockZeroer:
+         seg_addrs, page_size_el, blk_size, n_segs = self._meta
+         n_blocks = len(block_ids)
+         if n_blocks > self._id_cap:
++            # The old pinned buffers may still be the source of an in-flight
++            # nonblocking copy. Growing is rare, so we don't mind the sync overhead
++            torch.accelerator.synchronize()
+             self._id_cap = n_blocks * 2
+-            self._ids_pinned = torch.empty(
+-                self._id_cap,
+-                dtype=torch.int64,
+-                pin_memory=self.pin_memory,
+-            )
+-            self._ids_gpu = torch.empty(
+-                self._id_cap, dtype=torch.int64, device=self.device
+-            )
+-        assert self._ids_pinned is not None and self._ids_gpu is not None
+-        self._ids_pinned[:n_blocks].numpy()[:] = block_ids
+-        idx = self._ids_gpu[:n_blocks]
+-        idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
++            self._allocate_id_buffers()
++
++        # The H2D copy is nonblocking, so its pinned source must not be mutated
++        # while this batch is in flight. Rotate through as many buffers as concurrent
++        # in-flight batches, to avoid collisions.
++        buffer_index = self._id_buffer_index
++        self._id_buffer_index = (buffer_index + 1) % self.max_concurrency
++        ids_pinned = self._ids_pinned[buffer_index]
++        ids_pinned[:n_blocks].numpy()[:] = block_ids
++        idx = self._ids_gpu[buffer_index][:n_blocks]
++        idx.copy_(ids_pinned[:n_blocks], non_blocking=True)
+         grid = (n_blocks * n_segs * (page_size_el // blk_size),)
+         _zero_kv_blocks_kernel[grid](
+             seg_addrs,
+-- 
+2.43.0
+
+From 85b3a7264b6c4e4e89a1c45a2c4ccfd1b8c342dc Mon Sep 17 00:00:00 2001
+From: Woosuk Kwon <woosuk@inferact.ai>
+Date: Thu, 9 Jul 2026 06:26:27 -0700
+Subject: [PATCH] [Bugfix][Model Runner V2] Order uniform decodes first so spec
+ decodes aren't misclassified as prefills (#47381)
+
+Signed-off-by: Woosuk Kwon <woosuk@inferact.ai>
+Signed-off-by: Nick Hill <nickhill123@gmail.com>
+Co-authored-by: Claude Fable 5 <noreply@anthropic.com>
+Co-authored-by: Nick Hill <nickhill123@gmail.com>
+---
+ tests/v1/worker/test_gpu_batch_ordering.py | 70 ++++++++++++++++++++++
+ vllm/model_executor/models/deepseek_v2.py  |  7 ++-
+ vllm/v1/worker/gpu/model_runner.py         | 12 +++-
+ 3 files changed, 86 insertions(+), 3 deletions(-)
+ create mode 100644 tests/v1/worker/test_gpu_batch_ordering.py
+
+diff --git a/tests/v1/worker/test_gpu_batch_ordering.py b/tests/v1/worker/test_gpu_batch_ordering.py
+new file mode 100644
+index 000000000..2c2115dc8
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_batch_ordering.py
+@@ -0,0 +1,70 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Batch ordering in Model Runner V2 (vllm.v1.worker.gpu).
++
++split_decodes_and_prefills assumes decode -> short_extend -> prefill request
++ordering. With spec decode (decode_query_len > 1), a shorter chunked-prefill
++tail sorted in front of the uniform decodes misclassifies every decode as a
++prefill.
++"""
++
++import torch
++
++from vllm.v1.attention.backend import CommonAttentionMetadata
++from vllm.v1.attention.backends.utils import split_decodes_and_prefills
++from vllm.v1.worker.gpu.model_runner import sort_batch_req_ids
++
++
++def _make_common_attn_metadata(query_lens: list[int]) -> CommonAttentionMetadata:
++    num_reqs = len(query_lens)
++    num_tokens = sum(query_lens)
++    query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32)
++    torch.cumsum(
++        torch.tensor(query_lens, dtype=torch.int32), 0, out=query_start_loc[1:]
++    )
++    seq_lens = torch.tensor([1000 + q for q in query_lens], dtype=torch.int32)
++    return CommonAttentionMetadata(
++        query_start_loc=query_start_loc,
++        query_start_loc_cpu=query_start_loc,
++        seq_lens=seq_lens,
++        seq_lens_cpu_upper_bound=seq_lens,
++        max_seq_len=int(seq_lens.max()),
++        num_reqs=num_reqs,
++        num_actual_tokens=num_tokens,
++        max_query_len=max(query_lens),
++        block_table_tensor=torch.zeros(num_reqs, 1, dtype=torch.int32),
++        slot_mapping=torch.zeros(num_tokens, dtype=torch.int64),
++    )
++
++
++def test_sort_batch_req_ids_no_spec():
++    # decode_query_len == 1: plain ascending order (decodes first).
++    num_tokens_per_req = {"p1": 100, "d1": 1, "p2": 7, "d2": 1}
++    assert sort_batch_req_ids(num_tokens_per_req, 1) == ["d1", "d2", "p2", "p1"]
++
++
++def test_sort_batch_req_ids_spec_decode():
++    # decode_query_len == 2 (MTP k=1): uniform decodes lead, then the 1-token
++    # chunked-prefill tail, then longer prefills.
++    num_tokens_per_req = {"tail": 1, "d1": 2, "p1": 100, "d2": 2}
++    assert sort_batch_req_ids(num_tokens_per_req, 2) == ["d1", "d2", "tail", "p1"]
++
++
++def test_spec_decodes_lead_short_prefill_tail():
++    # With the fixed ordering, split_decodes_and_prefills classifies the
++    # uniform 2-token decodes as decodes even when a 1-token prefill tail is
++    # in the batch (indexer-style: require_uniform, threshold=1+k).
++    num_tokens_per_req = {"tail": 1, **{f"d{i}": 2 for i in range(8)}}
++    req_ids = sort_batch_req_ids(num_tokens_per_req, 2)
++    query_lens = [num_tokens_per_req[r] for r in req_ids]
++    assert query_lens == [2] * 8 + [1]
++
++    num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
++        split_decodes_and_prefills(
++            _make_common_attn_metadata(query_lens),
++            decode_threshold=2,
++            require_uniform=True,
++        )
++    )
++    assert (num_decodes, num_prefills) == (8, 1)
++    assert (num_decode_tokens, num_prefill_tokens) == (16, 1)
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 4290609cb..ac187151a 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -1156,7 +1156,12 @@ class DeepseekV2MLAAttention(nn.Module):
+             cache_config,
+             quant_config,
+             prefix,
+-            skip_topk=_skip_topk,
++            # MTP layers must never start with skip_topk=True: their indexer
++            # computes indices at draft step 0, and the runtime toggle
++            # (set_skip_topk, index_share_for_mtp_iteration) only exists in
++            # the V1 proposer. A frozen True would leave the draft reading a
++            # never-written topk buffer.
++            skip_topk=_skip_topk and not is_mtp_layer,
+         )
+ 
+     def forward(
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index f5f51a826..1f5dd4d2f 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -854,9 +854,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         num_tokens_per_req = scheduler_output.num_scheduled_tokens
+         num_reqs = len(num_tokens_per_req)
+ 
+-        # Decode first, then prefill.
+         # batch_idx -> req_id
+-        req_ids = sorted(num_tokens_per_req, key=num_tokens_per_req.get)  # type: ignore[arg-type]
++        req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
+         numtoks_iter = map(num_tokens_per_req.get, req_ids)
+         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
+ 
+@@ -1607,3 +1606,12 @@ class ExecuteModelState(NamedTuple):
+     hidden_states: torch.Tensor | None
+     aux_hidden_states: list[torch.Tensor] | None
+     finished_req_ids: set[str]
++
++
++def sort_batch_req_ids(
++    num_tokens_per_req: dict[str, int], decode_query_len: int
++) -> list[str]:
++    # Order decode -> short_extend -> prefill; split_decodes_and_prefills
++    # relies on uniform decodes (query_len == decode_query_len) leading.
++    key = lambda r: ((num := num_tokens_per_req[r]) != decode_query_len, num)
++    return sorted(num_tokens_per_req, key=key)
+-- 
+2.43.0
+
+From 0f5a46a8b1b8931afb34cf56e1ac0be19b14535b Mon Sep 17 00:00:00 2001
+From: Sebastiaan van Duijn <sebastiaan.vanduijn@triviumpackaging.com>
+Date: Mon, 6 Jul 2026 22:03:05 +0000
+Subject: [PATCH] Enable DCP for FlashInfer sparse MLA
+
+Assisted-by: OpenAI Codex
+Signed-off-by: Sebastiaan van Duijn <sebastiaan.vanduijn@triviumpackaging.com>
+---
+ .../test_flashinfer_sparse_mla_sm120_api.py   | 100 ++++++++++++++++++
+ .../mla/flashinfer_mla_sparse_sm120.py        |  75 +++++++++++--
+ 2 files changed, 165 insertions(+), 10 deletions(-)
+
+diff --git a/tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py b/tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
+index 3a7677e75..4b4f81f97 100644
+--- a/tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
++++ b/tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py
+@@ -9,9 +9,13 @@ import torch
+ from vllm.config import set_current_vllm_config
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils import flashinfer as fi_utils
++from vllm.v1.attention.backends.mla import flashinfer_mla_sparse_sm120 as sm120_module
+ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+     FlashInferMLASparseSM120Backend,
+ )
++from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm120 import (
++    FlashInferMLASparseSM120Impl,
++)
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+ 
+@@ -52,3 +56,99 @@ def test_v32_glm_sm120_backend_accepts_glm_block_size(
+         )
+ 
+     assert invalid_reasons == []
++
++
++def test_sm120_sparse_mla_dcp_plumbs_lse_and_valid_counts(
++    monkeypatch,
++) -> None:
++    monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
++    monkeypatch.setattr(
++        sm120_module,
++        "_get_workspace_buffer",
++        lambda device: torch.empty(1, dtype=torch.uint8, device=device),
++    )
++
++    num_tokens = 3
++    topk_tokens = 4
++    num_query_heads = 32
++    kv_lora_rank = 512
++    topk_indices = torch.arange(num_tokens * topk_tokens, dtype=torch.int32).reshape(
++        num_tokens, topk_tokens
++    )
++    topk_indices_physical = torch.tensor(
++        [[0, 1, -1, -1], [-1, -1, -1, -1], [4, 5, 6, 7]],
++        dtype=torch.int32,
++    )
++    seq_lens = torch.tensor([2, 0, 4], dtype=torch.int32)
++    captured: dict[str, dict[str, object]] = {}
++
++    def fake_filter_and_convert_dcp_index(*args: object, **kwargs: object):
++        captured["dcp_kwargs"] = kwargs
++        return topk_indices_physical, seq_lens
++
++    def fake_flashinfer_decode(**kwargs: object):
++        out = kwargs["out"]
++        assert isinstance(out, torch.Tensor)
++        assert out.shape == (num_tokens, 1, num_query_heads, kv_lora_rank)
++        assert kwargs["seq_lens"] is seq_lens
++        assert kwargs["return_lse"] is True
++        assert isinstance(kwargs["block_tables"], torch.Tensor)
++        assert kwargs["block_tables"].shape == (num_tokens, 1, topk_tokens)
++        out.fill_(1.0)
++        lse = torch.ones(num_tokens, 1, num_query_heads, dtype=torch.float32)
++        return out, lse
++
++    monkeypatch.setattr(
++        sm120_module,
++        "triton_filter_and_convert_dcp_index",
++        fake_filter_and_convert_dcp_index,
++    )
++    monkeypatch.setattr(
++        fi_utils,
++        "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
++        fake_flashinfer_decode,
++    )
++
++    with set_current_vllm_config(_fake_vllm_config("glm4_moe")):
++        impl = FlashInferMLASparseSM120Impl(
++            num_heads=8,
++            head_size=576,
++            scale=1.0,
++            num_kv_heads=1,
++            alibi_slopes=None,
++            sliding_window=None,
++            kv_cache_dtype="fp8_ds_mla",
++            logits_soft_cap=None,
++            attn_type="decoder",
++            kv_sharing_target_layer_name=None,
++            indexer=SimpleNamespace(topk_indices_buffer=topk_indices),
++            kv_lora_rank=kv_lora_rank,
++            qk_nope_head_dim=512,
++            qk_rope_head_dim=64,
++        )
++
++    impl.dcp_world_size = 4
++    impl.dcp_rank = 2
++    impl.need_to_return_lse_for_decode = True
++
++    q = torch.zeros(num_tokens, num_query_heads, 576, dtype=torch.bfloat16)
++    kv_cache = torch.zeros(1, 64, 656, dtype=torch.uint8)
++    metadata = SimpleNamespace(
++        req_id_per_token=torch.tensor([0, 0, 1], dtype=torch.int32),
++        block_table=torch.arange(8, dtype=torch.int32).reshape(2, 4),
++        block_size=64,
++        cp_kv_cache_interleave_size=1,
++        topk_tokens=topk_tokens,
++    )
++
++    out, lse = impl.forward_mqa(q, kv_cache, metadata, SimpleNamespace())
++
++    assert out.shape == (num_tokens, num_query_heads, kv_lora_rank)
++    assert lse is not None
++    assert lse.shape == (num_tokens, num_query_heads)
++    assert torch.all(out[0] == 1)
++    assert torch.all(out[1] == 0)
++    assert torch.isneginf(lse[1]).all()
++    assert captured["dcp_kwargs"]["dcp_size"] == 4
++    assert captured["dcp_kwargs"]["dcp_rank"] == 2
++    assert captured["dcp_kwargs"]["return_valid_counts"] is True
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+index d802f5688..c2a7ed1d0 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """SM120 implementation variant for ``FLASHINFER_MLA_SPARSE_SM120``."""
+ 
+-from typing import TYPE_CHECKING, cast
++from typing import TYPE_CHECKING
+ 
+ import torch
+ 
+@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+ )
+ from vllm.v1.attention.backends.mla.sparse_utils import (
+     triton_convert_req_index_to_global_index,
++    triton_filter_and_convert_dcp_index,
+ )
+ 
+ if TYPE_CHECKING:
+@@ -32,6 +33,9 @@ def _kv_scale_format_for_model(model_type: str | None) -> str:
+ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata]):
+     """SM120 FlashInfer sparse-MLA implementation."""
+ 
++    can_return_lse_for_decode: bool = True
++    lse_base_on_e: bool = False
++
+     def __init__(
+         self,
+         num_heads: int,
+@@ -115,19 +119,31 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
+         assert self.topk_indices_buffer is not None
+         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+ 
+-        topk_indices_physical = cast(
+-            torch.Tensor,
+-            triton_convert_req_index_to_global_index(
++        if self.dcp_world_size > 1:
++            topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(
+                 attn_metadata.req_id_per_token[:num_actual_toks],
+                 attn_metadata.block_table,
+                 topk_indices,
++                dcp_size=self.dcp_world_size,
++                dcp_rank=self.dcp_rank,
++                cp_kv_cache_interleave_size=(attn_metadata.cp_kv_cache_interleave_size),
+                 BLOCK_SIZE=attn_metadata.block_size,
+                 NUM_TOPK_TOKENS=topk_indices.shape[1],
+-            ),
+-        )
++                return_valid_counts=True,
++            )
++        else:
++            topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
++                attn_metadata.req_id_per_token[:num_actual_toks],
++                attn_metadata.block_table,
++                topk_indices,
++                BLOCK_SIZE=attn_metadata.block_size,
++                NUM_TOPK_TOKENS=topk_indices.shape[1],
++                return_valid_counts=True,
++            )
+ 
++        num_query_heads = q.shape[1]
+         output = q.new_empty(
+-            (num_actual_toks, self.num_heads, self.kv_lora_rank),
++            (num_actual_toks, num_query_heads, self.kv_lora_rank),
+             dtype=q.dtype,
+         )
+ 
+@@ -138,7 +154,7 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
+             flashinfer_trtllm_batch_decode_with_kv_cache_mla,
+         )
+ 
+-        out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
++        kernel_out = flashinfer_trtllm_batch_decode_with_kv_cache_mla(
+             query=q.unsqueeze(1),
+             kv_cache=kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
+             workspace_buffer=self._workspace_buffer,
+@@ -146,12 +162,51 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
+             kv_lora_rank=self.kv_lora_rank,
+             qk_rope_head_dim=self.qk_rope_head_dim,
+             block_tables=topk_indices_physical.unsqueeze(1),
+-            seq_lens=None,
++            seq_lens=seq_lens,
+             max_seq_len=attn_metadata.topk_tokens,
+             out=output.unsqueeze(1),
+             bmm1_scale=self.scale,
+             bmm2_scale=1.0,
+             sparse_mla_top_k=attn_metadata.topk_tokens,
++            return_lse=self.need_to_return_lse_for_decode,
+             kv_scale_format=self.kv_scale_format,
+         )
+-        return out.squeeze(1), None
++        if self.need_to_return_lse_for_decode:
++            assert isinstance(kernel_out, tuple)
++            out, lse = kernel_out
++        else:
++            assert isinstance(kernel_out, torch.Tensor)
++            out = kernel_out
++            lse = None
++
++        out = out.squeeze(1)
++        if lse is not None:
++            lse = self._normalize_lse(lse, out.shape[0], out.shape[1])
++            empty_rows = (topk_indices_physical == -1).all(dim=-1)
++            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
++            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
++        return out, lse
++
++    @staticmethod
++    def _normalize_lse(
++        lse: torch.Tensor,
++        num_tokens: int,
++        num_heads: int,
++    ) -> torch.Tensor:
++        # FlashInfer returns the decode LSE either as 2D (num_tokens, num_heads)
++        # or 3D ((num_tokens, num_heads, 1) / (num_tokens, 1, num_heads)).
++        # Collapse all of these to the (num_tokens, num_heads) the shared DCP
++        # reducer expects.
++        if lse.dim() == 3:
++            if lse.shape[-1] == 1:
++                lse = lse.squeeze(-1)
++            elif lse.shape[1] == 1:
++                lse = lse.squeeze(1)
++            elif lse.shape[0] * lse.shape[1] == num_tokens:
++                lse = lse.reshape(num_tokens, lse.shape[-1])
++        if lse.shape != (num_tokens, num_heads):
++            raise RuntimeError(
++                "Unexpected FlashInfer SM120 sparse MLA LSE shape: "
++                f"{tuple(lse.shape)}, expected ({num_tokens}, {num_heads})."
++            )
++        return lse
+-- 
+2.43.0
+

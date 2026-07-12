@@ -1,0 +1,69 @@
+services:
+  vllm:
+    build: .
+    image: glm52-vllm:v0.25.0-fix
+    container_name: glm52-vllm
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    ipc: host
+    # Model weights are ~433 GiB; serving from tmpfs/RAM-backed storage loads
+    # in ~30 s. Mount your model directory here (or point MODEL_DIR elsewhere).
+    volumes:
+      - ${MODEL_DIR:-/models/glm52}:/model:ro
+      - ${CACHE_DIR:-./vllm-cache}:/root/.cache/vllm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      # --- PCIe-safe NCCL profile (dual-socket, 8x RTX PRO 6000, NO NVLink).
+      # P2P must stay disabled: NCCL deadlocks at init otherwise, and the
+      # measured P2P/PIX variant was ~30% slower anyway.
+      NCCL_P2P_DISABLE: "1"
+      NCCL_P2P_LEVEL: "SYS"
+      NCCL_CUMEM_ENABLE: "0"
+      NCCL_CUMEM_HOST_ENABLE: "0"
+      NCCL_NVLS_ENABLE: "0"
+      NCCL_COLLNET_ENABLE: "0"
+      NCCL_IB_DISABLE: "1"
+      NCCL_PROTO: "LL,LL128,Simple"
+      # --- misc
+      CUDA_DEVICE_MAX_CONNECTIONS: "32"
+      OMP_NUM_THREADS: "16"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      VLLM_CACHE_ROOT: "/root/.cache/vllm"
+    # Default lane: TP8 + MTP3, DCP off.
+    # For the long-context lane (6 users x 256k), see README (DCP4 variant).
+    command:
+      - vllm
+      - serve
+      - /model
+      - --host=0.0.0.0
+      - --port=8000
+      - --served-model-name=GLM-5.2-NVFP4
+      - --tensor-parallel-size=8
+      - --enable-expert-parallel
+      - --kv-cache-dtype=fp8_e4m3
+      - --gpu-memory-utilization=0.9448
+      - --max-model-len=131072
+      - --max-num-seqs=16
+      - --max-num-batched-tokens=8192
+      - --speculative-config={"method":"mtp","num_speculative_tokens":3}
+      - --attention-backend=FLASHINFER_MLA_SPARSE_SM120
+      - --generation-config=vllm
+      - --reasoning-parser=glm45
+      - --tool-call-parser=glm47
+      - --enable-auto-tool-choice
+      - --disable-custom-all-reduce
+      - --trust-remote-code
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 600s
+      retries: 5
